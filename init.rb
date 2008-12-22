@@ -2,25 +2,49 @@
 ######################################################################
 ### Auto Nested Layout
 ActionController::Base.class_eval do
-  class_inheritable_array :nested_layouts
-  self.nested_layouts = []
-
-  unless respond_to?(:find_filter)
-    def self.find_filter(name)
-      filter_chain.find(name)
-    end
-  end
-
   class << self
-    def nested_layout(*files)
-      find_filter(:render_with_nested_layouts) or
-        after_filter :render_with_nested_layouts
-      self.nested_layouts ||= [] # I don't know why this code is needed
-      self.nested_layouts = self.nested_layouts + files
+    def nested_layout(files = ['application'], options = {})
+      if files.blank?
+        # 対象ファイルが指定されていなければ ['layouts/application'] にする
+        files = ['layouts/application']
+      else
+        # ひとつめのファイルは layouts 以下に置かれているものにする
+        files[0] = 'layouts/' + files[0]
+      end
+      
       layout false
+      
+      filter = NestedLayoutFilter.new
+      filter.layouts = files
+      filter.layouts_mobile = files.collect{|layout| layout + '_mobile'}
+      
+      around_filter filter, options
+        # around_filter に変更　jpmobile との関係での文字化けに対応
+        # options 追加
     end
   end
+  
+  def render_with_nested_layouts(layouts)
+    return true if guard_from_nested_layouts
 
+    if layouts.size <= 1
+      guess_layouts = guess_nested_layouts
+      guess_layouts.collect!{|layout| layout + '_mobile'} if request.mobile?
+      layouts.concat(guess_layouts)
+      layouts.reverse!
+    end
+
+    logger.debug "Rendering nested layouts %s" % layouts.inspect
+
+    layouts.each do |layout|
+      content_for_layout = response.body
+      erase_render_results
+      add_variables_to_assigns
+      @template.instance_variable_set("@content_for_layout", content_for_layout)
+      render :partial => layout
+    end
+  end
+      
 private
   def guard_from_nested_layouts
     return true if @before_filter_chain_aborted
@@ -31,34 +55,33 @@ private
   end
 
   def guess_nested_layouts
-    relative_paths = controller_path.split('/')
-    relative_paths.unshift ''  # stands for "app/views"
-
-    layouts = []
-    pushed  = ''
-    relative_paths.each do |dir|
-      pushed << "#{dir}/"
-      real_path = (Pathname(RAILS_ROOT) + "app/views").to_s + pushed
-      layouts << pushed + "layout" unless Dir["#{real_path}_layout.*"].blank?
+    layouts      = [Pathname("/")]
+    partial_path = @template.send(:partial_pieces, "layout").first
+    partial_path.split('/').each{|dir| layouts << layouts.last + dir unless dir.to_s == "."}
+    
+    if request.mobile?
+      layouts.reject!{|path| !(Pathname(RAILS_ROOT) + "app/views#{path}" + "_layout_mobile.rhtml").exist? }
+    else
+      layouts.reject!{|path| !(Pathname(RAILS_ROOT) + "app/views#{path}" + "_layout.rhtml").exist? }
     end
-
-    return layouts
+    return layouts.reverse.map{|i| (i+"layout").to_s}
   end
 
-  def render_with_nested_layouts
-    return true if guard_from_nested_layouts
-
-    layouts = self.class.nested_layouts
-    layouts = guess_nested_layouts if layouts.blank?
-
-    logger.debug "Rendering nested layouts %s" % layouts.inspect
-
-    layouts.reverse.each do |layout|
-      content_for_layout = response.body
-      erase_render_results
-      add_variables_to_assigns if respond_to?(:add_variables_to_assigns, true)
-      @template.instance_variable_set("@content_for_layout", content_for_layout)
-      render :partial=>layout
+  # 追加
+  class NestedLayoutFilter
+    attr_accessor :layouts, :layouts_mobile
+    
+    def before(controller)
+      controller.class.layout false
+      return
+    end
+    
+    def after(controller)
+      if controller.request.mobile?
+        controller.render_with_nested_layouts(layouts_mobile)
+      else
+        controller.render_with_nested_layouts(layouts)
+      end
     end
   end
 end
